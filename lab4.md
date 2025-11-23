@@ -321,6 +321,224 @@ proc_run(struct proc_struct *proc) {
   - 绑定执行函数 `init_main`，运行时会打印 `this initproc, pid = 1, name = "init"` 等信息。
 - **核心作用**：系统首个有功能的内核线程，负责完成内核子系统的后续初始化工作，是用户进程的“父进程”样例。
 
+## 扩展练习 Challenge
+
+### 1、local_intr_save(intr_flag) 和 local_intr_restore(intr_flag) 是怎样实现开关中断的？
+
+相关宏定义在 `kern/sync/sync.h` 中，核心代码大致如下：
+
+```c
+static inline bool __intr_save(void) {
+    if (read_csr(sstatus) & SSTATUS_SIE) {
+        intr_disable();
+        return 1;
+    }
+    return 0;
+}
+
+static inline void __intr_restore(bool flag) {
+    if (flag) {
+        intr_enable();
+    }
+}
+
+#define local_intr_save(x) \
+    do {                   \
+        x = __intr_save(); \
+    } while (0)
+
+#define local_intr_restore(x) __intr_restore(x)
+```
+
+RISC-V 用 `sstatus` 寄存器里的 **SIE 位** 来控制当前特权级是否响应中断：
+
+- SIE = 1：允许响应中断（一般说“开中断”）；
+- SIE = 0：不响应中断（一般说“关中断”）。
+
+`intr_disable()` 和 `intr_enable()` 本质上就是把 `sstatus` 里的 SIE 位清零或置一。
+
+在这个前提下，可以把 `local_intr_save` / `local_intr_restore` 看成一对“进入临界区前后保护中断状态”的工具。
+
+#### （1）local_intr_save(intr_flag) 的作用
+
+`local_intr_save(intr_flag)` 宏会调用 `__intr_save()`，并把返回值写进变量 `intr_flag`。它的执行过程可以分成两种情况：
+
+1. **当前是开中断：**
+
+   ```c
+   if (read_csr(sstatus) & SSTATUS_SIE) {
+       intr_disable();
+       return 1;
+   }
+   ```
+
+   - 先读取 `sstatus`，发现 SIE = 1，说明现在是开中断；
+   - 调用 `intr_disable()` 把中断关掉；
+   - 返回 1，表示“进入这段代码之前是开中断”。
+
+   这时 `intr_flag` 会被设置为 1。
+
+2. **当前已经是关中断：**
+
+   ```c
+   return 0;
+   ```
+
+   - `__intr_save()` 不再修改任何寄存器，直接返回 0；
+   - `intr_flag` 被设置为 0，表示“进入之前就是关中断”。
+
+这样，从 `local_intr_save(intr_flag)` 执行完成开始，到后面调用 `local_intr_restore(intr_flag)` 之前，中断都处于关闭状态。也就是说，包在这对宏中间的代码可以认为不会被中断打断，适合做需要原子性的一些内核操作。
+
+#### （2）local_intr_restore(intr_flag) 的作用
+
+`local_intr_restore(intr_flag)` 会把 `intr_flag` 传给 `__intr_restore()`：
+
+```c
+static inline void __intr_restore(bool flag) {
+    if (flag) {
+        intr_enable();
+    }
+}
+```
+
+可以分两种情况理解：
+
+1. 如果 `intr_flag == 1`，说明在进入临界区之前，中断本来就是开的，并且在 `__intr_save()` 中被关掉了。此时 `__intr_restore()` 会调用 `intr_enable()` 把 SIE 位重新置为 1，恢复到“开中断”的状态。
+
+2. 如果 `intr_flag == 0`，说明进入临界区之前就已经是关中断，`__intr_save()` 没有改变中断状态。为了不打乱外层代码的逻辑，`__intr_restore()` 在这种情况下不会去开启中断，而是保持当前的关闭状态。
+
+#### （3）这对宏实现“开关中断”的整体思路
+
+综合上面两部分，可以用一句话来概括这对宏的设计思路：
+
+> 进入临界区前，先记住当前是不是开中断，如果是就先关掉；离开临界区时，再根据之前记录的结果决定要不要重新打开。
+
+这样做有两个好处：
+
+1. 临界区内的代码在关中断的环境下执行，避免中断在关键修改过程中打断内核逻辑。
+2. 不会破坏外层原本的中断状态，支持嵌套使用。如果外层已经关了中断，内层再调用一对 `local_intr_save` / `local_intr_restore`，最后也不会把中断误打开。
+
+---
+
+### 2、get_pte 函数中两段相似代码的原因，以及“查找 + 分配”写在一起好不好
+
+`get_pte()` 用来在多级页表中找到一个虚拟地址对应的页表项位置，它的定义在 `kern/mm/pmm.c` 中。关键部分大致如下（省略了一些注释）：
+
+```c
+pte_t *get_pte(pde_t *pgdir, uintptr_t la, bool create) {
+    pde_t *pdep1 = &pgdir[PDX1(la)];
+    if (!(*pdep1 & PTE_V)) {
+        struct Page *page;
+        if (!create || (page = alloc_page()) == NULL) {
+            return NULL;
+        }
+        set_page_ref(page, 1);
+        uintptr_t pa = page2pa(page);
+        memset(KADDR(pa), 0, PGSIZE);
+        *pdep1 = pte_create(page2ppn(page), PTE_U | PTE_V);
+    }
+
+    pde_t *pdep0 = &((pde_t *)KADDR(PDE_ADDR(*pdep1)))[PDX0(la)];
+    if (!(*pdep0 & PTE_V)) {
+        struct Page *page;
+        if (!create || (page = alloc_page()) == NULL) {
+            return NULL;
+        }
+        set_page_ref(page, 1);
+        uintptr_t pa = page2pa(page);
+        memset(KADDR(pa), 0, PGSIZE);
+        *pdep0 = pte_create(page2ppn(page), PTE_U | PTE_V);
+    }
+
+    return &((pte_t *)KADDR(PDE_ADDR(*pdep0)))[PTX(la)];
+}
+```
+
+可以看到，对 `pdep1` 和 `pdep0` 的处理方式几乎一模一样，只是用的索引宏不同（`PDX1`、`PDX0`），最后再用 `PTX` 取出最终的 PTE。
+
+#### （1）为什么会出现两段非常相似的代码？
+
+这和 RISC-V 不同分页模式的结构有关。以本实验使用的 Sv39 为例，虚拟地址被拆成三段 VPN：
+
+- VPN[2]：第一级页目录（对应代码里的 `PDX1(la)`）；
+- VPN[1]：第二级页目录（对应 `PDX0(la)`）；
+- VPN[0]：第三级页表（对应 `PTX(la)`）。
+
+访问一个虚拟地址时，硬件和软件做的事情其实都遵循同一个“套路”：
+
+1. 先用最高那一段 VPN 去访问第一级页目录；
+2. 目录项有效的话，得到下一级页表的物理地址；如果这个目录项无效，而软件希望支持按需创建，就需要先分配一页新的页表，并清零；
+3. 再用第二段 VPN 去访问下一级目录或页表；
+4. 最后用最后一段 VPN 去访问最终的 PTE。
+
+也就是说，**每往下一层，都是同样的一步：根据索引找到当前层的表项，如果需要就分配一页新的页表，然后继续往下。**
+
+在 Sv32 中只有两级页表，整个过程需要一段这样的逻辑；在 Sv39 中有三级，就会出现两段几乎一样的代码；在 Sv48 中有四级，代码中类似的结构会更多。不同分页模式的差别主要在“有几级”和“每一段 VPN 有多宽”，而不是在“每一层的处理方式”。
+
+所以 `get_pte()` 里出现两段几乎一样的代码，其实就是多级页表结构的直接反映：第一级和第二级目录在软件层面需要做的工作都是“检查表项是否有效，如果无效且允许创建，就分配一页新的页表”。
+
+#### （2）这两段代码分别在做什么？
+
+可以按“从外到内”的顺序来理解：
+
+1. **处理第一级目录（VPN[2]）**
+
+   - 用 `PDX1(la)` 在 `pgdir` 这页（一页顶 512 个目录项）中找到对应的目录项 `pdep1`；
+   - 如果 `*pdep1` 无效（没有设置 `PTE_V`），说明这一段虚拟地址还没有对应的二级目录页表；
+   - 当 `create == 1` 时，就调用 `alloc_page()` 分配一页物理内存，把这一页清零，然后通过 `pte_create` 把这页的物理页号写入 `pdep1`，并设置 `PTE_V` 等标志；
+   - 这样，`pdep1` 就指向了一张新的“二级目录页表”。
+
+2. **处理第二级目录（VPN[1]）**
+
+   - 通过 `PDE_ADDR(*pdep1)` 取出 `pdep1` 指向页表的物理地址，再用 `KADDR` 转成内核虚拟地址，得到一个 `pde_t *` 类型的指针；
+   - 用 `PDX0(la)` 在这张页表里找到第二级目录项 `pdep0`；
+   - 如果 `*pdep0` 无效，且 `create == 1`，就再分配一页作为第三级页表页，同样清零并写入 `pdep0`；
+   - 这样，`pdep0` 就指向了最终的“三级页表页”。
+
+3. **返回第三级页表中的条目地址**
+
+   - 再用 `PDE_ADDR(*pdep0)` 找到第三级页表页的物理地址，通过 `KADDR` 转成虚拟地址；
+   - 用 `PTX(la)` 在该页里找到具体的 PTE 条目；
+   - 把这个条目的地址作为返回值交给上层函数（比如 `page_insert`）使用。
+
+整个过程就是“沿着 VPN[2] → VPN[1] → VPN[0] 这三级索引一路走下去，如果中间某一级不存在，就按需要分配并初始化一页新的页表页”，所以会自然形成两段结构完全相似的代码。
+
+#### （3）现在的 get_pte 写法好不好？要不要把“查找”和“分配”拆开？
+
+从接口上看，`get_pte(pgdir, la, create)` 同时承担了两个角色：
+
+1. **查找角色**：当 `create == 0` 时，只负责沿着多级页表查找，任何一级缺失都会直接返回 `NULL`；
+2. **分配角色**：当 `create == 1` 时，如果途中发现目录项无效，就自动分配新的页表页，把路径补齐。
+
+这种合并写法有一些优点，也有一些缺点。
+
+**优点：**
+
+- 上层调用很方便。  
+  例如在 `page_insert()` 里，只需要写：
+
+  ```c
+  pte_t *ptep = get_pte(pgdir, la, 1);
+  ```
+
+  就能保证路径上的目录页表全部准备好，不用在 `page_insert` 里反复判断“这一层有没有页表，要不要先 alloc 一下”。
+
+- 对于本实验这种“预先建立映射”的场景来说，非常直接，代码量也更少，有利于理解整体流程。
+
+**缺点：**
+
+- 函数的职责不够单一。  
+  有时候调用者只想“看看当前有没有映射”，并不希望顺带创建新的页表页。虽然可以通过 `create == 0` 来控制，但函数名叫 `get_pte`，不看参数的话很容易误以为它总是“保证有一个 PTE”。
+
+- 调试和扩展时不够灵活。  
+  如果后面要引入缺页异常、按需建表、统计页表页分配次数等功能，把“查找”和“分配”分成两个函数会更清楚。例如可以设计：
+  - `pte_t *find_pte(pgdir, la)`：只查找，不分配。
+  - `pte_t *get_or_create_pte(pgdir, la)`：在需要写映射时使用，找不到就自动分配。
+
+综合来看，以当前 Lab 的规模和目的来说，把查找和分配写在一个函数中是可以接受的，优点是实现简单、调用方便。  
+如果以后在这个内核基础上继续扩展，或者希望页表管理模块更清晰、更易于维护，那么把“纯查找”和“查找 + 分配”拆开成两个接口，会更加合理。
+
+
 ## 重要知识点
 
 ### 实验运行核心知识点：系统初始化与双重虚拟化
