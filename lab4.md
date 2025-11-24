@@ -1493,7 +1493,73 @@ static struct proc_struct *alloc_proc(void)
 4. **`mm = NULL`**：所有内核线程的 `mm` 都为 NULL，表示它们共享内核地址空间。
 
 
+### __kmalloc 函数解析
+#### 一、函数概述
+`__kmalloc`是基于**SLOB（Simple List Of Blocks，简单块链表）内存分配器**实现的内核态内存底层分配函数，广泛应用于 uCore 或 Linux 嵌入式版本中。其核心设计思路是**根据申请内存的大小区分分配策略**：对小内存块采用 SLOB 链表精细化管理，对大内存块直接复用内核物理页分配机制，兼顾内存利用率与分配效率，是内核内存管理的核心入口之一。
 
+#### 二、函数基本信息
+##### 2.1 函数定义原型
+```c
+static void *__kmalloc(size_t size, gfp_t gfp);
+```
+
+##### 2.2 参数说明
+- `size`：类型为`size_t`，代表需要分配的内存字节数，即用户实际的内存需求大小。
+- `gfp`：类型为`gfp_t`，是内存分配标志（Get Free Pages Flag），用于控制内存分配的行为，比如是否允许分配过程中睡眠（如GFP_KERNEL标志）、是否支持在中断上下文进行分配（如GFP_ATOMIC标志）等。
+
+##### 2.3 返回值
+函数返回值类型为`void *`，分配成功时会返回用户可直接使用的内存数据区起始地址；若分配失败，则返回`NULL`（即0）。
+
+#### 三、核心变量解析
+- `m`：类型为`slob_t *`，指向SLOB分配器管理的小内存块元数据结构体，该结构体用于记录小内存块的大小、空闲状态、链表指针等核心管理信息。
+- `bb`：类型为`bigblock_t *`，指向大内存块的管理元数据结构体，主要记录大内存块对应的物理页阶数、物理页起始地址、全局链表的下一个节点指针等信息。
+- `flags`：类型为`unsigned long`，用于保存CPU的中断状态，配合自旋锁使用，实现对全局链表操作的并发访问保护，避免多CPU或中断上下文下出现链表数据错乱的竞态问题。
+
+#### 四、核心分支逻辑解析
+函数核心通过判断申请内存大小与阈值（`PAGE_SIZE - SLOB_UNIT`）的关系，分为「小内存块分配」和「大内存块分配」两个分支。其中`PAGE_SIZE`为物理页大小，通常为4KB；`SLOB_UNIT`是`slob_t`结构体的字节数，即小内存块的元数据开销。
+
+##### 4.1 分支1：小内存块分配（size < PAGE_SIZE - SLOB_UNIT）
+当申请内存加上元数据开销后仍小于一个物理页时，采用SLOB分配器的链表管理策略，具体代码与操作如下：
+```c
+if (size < PAGE_SIZE - SLOB_UNIT)
+{
+    m = slob_alloc(size + SLOB_UNIT, gfp, 0);
+    return m ? (void *)(m + 1) : 0;
+}
+```
+1. **元数据+数据区统一分配**：调用`slob_alloc`函数申请`size + SLOB_UNIT`字节的内存，其中`SLOB_UNIT`对应的空间用于存储`slob_t`元数据，`size`对应的空间是用户实际需要的内存数据区。
+2. **返回地址处理**：若分配成功（`m != NULL`），返回`m + 1`，即跳过`slob_t`元数据区，直接指向用户可操作的数据区；若分配失败（`m == NULL`），则返回`NULL`提示分配失败。
+
+##### 4.2 分支2：大内存块分配（size ≥ PAGE_SIZE - SLOB_UNIT）
+当申请内存较大时，直接通过内核物理页分配器获取连续物理页，并用`bigblock_t`结构体跟踪管理，流程分为「元数据分配→物理页分配→链表管理→失败回滚」四步，具体代码与操作如下：
+```c
+// 步骤1：分配大内存块管理结构体 bigblock_t
+bb = slob_alloc(sizeof(bigblock_t), gfp, 0);
+if (!bb)
+    return 0;
+
+// 步骤2：计算页阶数并分配连续物理页
+bb->order = find_order(size);
+bb->pages = (void *)__slob_get_free_pages(gfp, bb->order);
+
+// 步骤3：分配成功则加入全局链表
+if (bb->pages)
+{
+    spin_lock_irqsave(&block_lock, flags);
+    bb->next = bigblocks;
+    bigblocks = bb;
+    spin_unlock_irqrestore(&block_lock, flags);
+    return bb->pages;
+}
+
+// 步骤4：分配失败则回滚释放元数据
+slob_free(bb, sizeof(bigblock_t));
+return 0;
+```
+1. **分配bigblock_t元数据**：`bigblock_t`本身属于小内存（远小于1个物理页），因此复用SLOB分配器进行分配。若该步骤分配失败，直接返回`NULL`，因为元数据是大内存块管理的基础，必须优先保证其分配成功。
+2. **物理页分配**：首先调用`find_order(size)`计算满足内存需求的最小物理页阶数，`order = n`代表分配`2^n`个连续物理页，例如`order=2`对应4个连续物理页（16KB）；随后调用`__slob_get_free_pages(gfp, bb->order)`向内核页分配器申请对应数量的连续物理页，返回的物理页起始虚拟地址存入`bb->pages`，该地址也是用户可使用的大内存数据区地址。
+3. **全局链表管理**：为实现大内存块的统一回收，需要将`bigblock_t`纳入全局链表`bigblocks`管理。操作时通过`spin_lock_irqsave`和`spin_unlock_irqrestore`实现自旋锁加锁与解锁，并保存/恢复中断状态，防止多CPU或中断上下文并发操作链表导致数据错乱；随后将新的大内存块节点挂到链表头部（`bb->next = bigblocks; bigblocks = bb`），实现高效插入，最终返回`bb->pages`作为用户数据区地址。
+4. **失败回滚**：若物理页分配失败（`bb->pages == NULL`），需调用`slob_free`释放之前分配的`bigblock_t`元数据，避免内存泄漏，最终返回`NULL`提示分配失败。
 
 
 
