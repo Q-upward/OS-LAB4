@@ -110,10 +110,77 @@ if (proc != NULL)
 
 ## 练习2:为新创建的内核线程分配资源
 
-### 一、设计实现过程简要说明
+### 一、设计实现过程说明
 
-本次实验的核心任务是实现程序分配资源的部分（即`do_fork` 函数），该函数负责克隆当前进程以创建一个新的子进程，并为其分配运行所需的资源和上下文。
+#### do_fork：进程创建的核心流程
 
+##### **功能作用**
+`do_fork` 是创建新进程/线程的**核心函数**，它通过复制当前进程（父进程）来创建子进程，完成进程控制块分配、资源设置、上下文初始化等所有必要步骤。
+
+##### **具体实现分析**
+
+```c
+int do_fork(uint32_t clone_flags, uintptr_t stack, struct trapframe *tf)
+{
+    int ret = -E_NO_FREE_PROC;
+    struct proc_struct *proc;
+    
+    // 检查进程数量限制
+    if (nr_process >= MAX_PROCESS) {
+        goto fork_out;
+    }
+    ret = -E_NO_MEM;
+    
+    // 1. 分配进程控制块
+    if ((proc = alloc_proc()) == NULL) {
+        goto fork_out; 
+    }
+
+    // 2. 分配内核栈
+    if (setup_kstack(proc) != 0) {
+        goto bad_fork_cleanup_proc;
+    }
+
+    // 设置父进程指针
+    proc->parent = current;
+
+    // 3. 复制内存管理结构
+    if (copy_mm(clone_flags, proc) != 0) {
+        goto bad_fork_cleanup_kstack;
+    }
+
+    // 4. 设置执行上下文
+    copy_thread(proc, stack, tf);
+
+    // 5. 关键区操作（需要原子性）
+    bool intr_flag;
+    local_intr_save(intr_flag);  // 禁用中断
+    {
+        // 分配PID并加入各种列表
+        proc->pid = get_pid(); 
+        hash_proc(proc);
+        list_add(&proc_list, &proc->list_link);
+        nr_process++;
+
+        // 6. 设置进程为可运行状态
+        proc->state = PROC_RUNNABLE;
+    }
+    local_intr_restore(intr_flag);  // 恢复中断
+
+    // 7. 返回子进程PID
+    ret = proc->pid;
+
+fork_out:
+    return ret;
+
+// 错误处理路径
+bad_fork_cleanup_kstack:
+    put_kstack(proc);
+bad_fork_cleanup_proc:
+    kfree(proc);
+    goto fork_out;
+}
+```
 `do_fork` 函数的实现遵循了标准的操作系统进程创建流程，概括为以下七个关键步骤，并确保了资源分配的原子性和失败时的清理：
 
 1.  **分配进程控制块（PCB）**：
@@ -140,6 +207,49 @@ if (proc != NULL)
 
 7.  **返回结果**：
     * 父进程返回新创建的子进程的 PID，表示创建成功。
+
+##### **关键设计要点**
+
+###### **分层错误处理机制**
+```c
+// 资源申请顺序（必须逆序释放）
+alloc_proc() → setup_kstack() → copy_mm() → copy_thread()
+
+// 对应的错误处理标签
+bad_fork_cleanup_proc:    // 清理proc
+bad_fork_cleanup_kstack:  // 清理kstack，然后清理proc
+```
+这种设计确保了资源不会泄漏，符合"谁申请谁释放"的原则。
+
+
+
+###### **参数含义**
+- **`clone_flags`**：控制克隆行为的标志位
+  - `CLONE_VM`：共享地址空间（创建线程）
+  - 其他标志控制文件描述符、信号处理等的共享行为
+- **`stack`**：用户栈指针（对内核线程为0）
+- **`tf`**：陷阱帧模板，包含子进程的初始执行上下文
+
+##### **进程创建完整流程总结**
+
+```mermaid
+graph TD
+    A[do_fork开始] --> B[alloc_proc分配PCB]
+    B --> C[setup_kstack分配内核栈]
+    C --> D[copy_mm设置内存空间]
+    D --> E[copy_thread设置执行上下文]
+    E --> F[进入关键区禁用中断]
+    F --> G[get_pid分配PID]
+    G --> H[hash_proc加入哈希表]
+    H --> I[list_add加入进程链表]
+    I --> J[设置PROC_RUNNABLE状态]
+    J --> K[离开关键区启用中断]
+    K --> L[返回子进程PID]
+    
+    B -->|失败| M[直接返回错误]
+    C -->|失败| N[清理PCB后返回]
+    D -->|失败| O[清理内核栈和PCB后返回]
+```
 
 ### 二、思考题回答：ucore 是否做到给每个新 fork 的进程一个唯一的 ID？
 
@@ -779,37 +889,6 @@ pte_t *get_pte(pde_t *pgdir, uintptr_t la, bool create) {
 
 通过这一系列断言，测试确保了：页面分配、映射建立、权限设置、重映射清理、引用计数增减、页面回收、映射删除等所有核心功能都按预期工作。
 
-### `kernel_thread`函数的作用
-- **概述**：kernel_thread函数用于在内核空间中创建一个新的内核线程。该函数是创建内核线程的核心接口，它通过设置陷阱帧（trapframe）来初始化线程的执行环境，并最终调用 do_fork完成实际创建过程。
-- 函数原型：`int kernel_thread(int (*fn)(void *), void *arg, uint32_t clone_flags)`
-  - fn:线程入口指针；
-  - arg:线程入口参数；
-  - clone_flags:设置线程的属性，包括是否共享内存空间、是否复制页表等。
-  - 成功返回新进程的PID，失败返回错误码。
-
-- **实现**：kernel_thread函数的实现主要分为以下几个步骤：
-  1. 初始化陷阱帧
-     - 使用 memset清零陷阱帧 tf，确保所有字段初始化为零
-     - 设置关键寄存器
-       - tf.gpr.s0保存函数指针 fn的地址
-       - tf.gpr.s1保存参数 arg的地址，供线程函数使用
-     - 设置状态寄存器tf.status
-       - 通过 read_csr(sstatus)读取当前值，并添加 SSTATUS_SPP（表示线程起始于内核态）和 SSTATUS_SPIE（允许中断），同时清除 SSTATUS_SIE（禁用中断），确保线程安全进入内核态
-     - 设置异常程序计数器 tf.epc为 kernel_thread_entry的地址。这是一个汇编入口点，用于实际跳转到线程函数
-  2. 调用 do_fork 创建线程
-      - 调用 do_fork(clone_flags | CLONE_VM, 0, &tf)，其中
-        - CLONE_VM强制共享内存空间，表明创建的是线程而非独立进程
-        - 堆栈参数 stack=0，因为内核线程使用独立内核栈（通过 setup_kstack分配）
-        - 陷阱帧 tf被传递，用于在新线程中恢复上下文
-       - o_fork会进一步调用 copy_thread将 tf复制到新线程的内核栈顶，并设置上下文中的 ra（返回地址）为 forkret，确保线程首次调度时从 kernel_thread_entry开始执行 
-  3. 线程执行流程
-     - 新线程启动时，从 tf.epc（即 kernel_thread_entry）开始执行。该入口函数会从 s0和 s1寄存器取出 fn和 arg，并调用 fn(arg)。
-     - 线程函数执行完毕后，通过 do_exit退出
-     - 若 do_fork失败（如进程数超限或内存不足），返回错误码（负值）
-- 在函数中使用位置
-  - 用于创建初始化过程中的第二个内核线程。在系统启动时，第一个线程 idleproc（PID=0）创建后，通过 kernel_thread创建 initproc（PID=1）。该线程执行 init_main函数，打印初始化信息
-
-
 
 ### **copy_mm：复制进程的内存空间**
 
@@ -856,60 +935,6 @@ good_mm:
 2.  **初始化页表**：`mm_init` 函数会调用 `mm_alloc_pgd` 为新进程分配页全局目录（PGD），并**复制内核空间的页表项**。这是因为所有进程的内核空间映射都是相同的。
 3.  **复制用户空间映射**：`dup_mmap` 函数是核心，它遍历父进程的所有虚拟内存区域（VMA），并为子进程创建对应的VMA。关键在于，它调用 `copy_page_range` 等函数**复制的是页表项（PTE），而非实际的物理页面**。在复制过程中，对于可写且私有的页面，会将父子进程对应页表项的权限设置为**只读**。这样，当任何一方尝试写入时，便会触发缺页异常，内核在异常处理程序（如 `do_wp_page`）中才真正分配新的物理页面并复制数据，这就是“写时复制”。
 
-### **copy_thread：设置陷阱帧和上下文**
-
-`copy_thread` 函数负责初始化子进程第一次被调度执行时所需要的关键数据：**陷阱帧（Trap Frame, `tf`）** 和**进程上下文（Context, `context`）**。这使得子进程能够从一个特定的起点开始运行。
-
-以下是一个概念性的实现逻辑，展示了其主要步骤：
-
-```c
-static void copy_thread(struct proc_struct *proc, uintptr_t esp, struct trapframe *tf) {
-    // 1. 在子进程内核栈顶分配陷阱帧空间，并复制父进程传递来的模板tf
-    proc->tf = (struct trapframe*)(proc->kstack + KSTACKSIZE - sizeof(struct trapframe));
-    *(proc->tf) = *tf;
-
-    // 2. 对于子进程（fork情况），令其返回值为0（通过寄存器a0传递）
-    proc->tf->gpr.a0 = 0; // 这使子进程在用户态能感知到fork返回0
-
-    // 3. 设置子进程的内核栈指针。若esp为0（内核线程），则使用tf的地址
-    proc->tf->gpr.sp = (esp == 0) ? (uintptr_t)proc->tf : esp;
-
-    // 4. 设置上下文中的返回地址和栈指针，用于第一次切换到子进程
-    proc->context.ra = (uintptr_t)forkret; // ra: 第一次切换后跳转到的函数
-    proc->context.sp = (uintptr_t)(proc->tf); // sp: 内核栈栈顶位置
-}
-```
-
-**参数与作用分析：**
-
-*   `proc`: 子进程的控制块。
-*   `esp`: **用户栈指针**。如果此参数为0，表示创建的是内核线程，它没有用户空间，因此不需要用户栈。
-*   `tf`: **陷阱帧模板**。通常由父进程在调用 `kernel_thread` 或进行系统调用时提前设置好，包含了预期的执行入口点（如 `tf.epc`）、函数参数（如保存在 `tf.gpr.s0`, `s1`）、状态寄存器等关键信息。
-
-**功能详解：**
-
-1.  **设置陷阱帧（Trap Frame）**：
-    *   **位置**：陷阱帧通常保存在子进程**内核栈的顶端**。
-    *   **内容**：复制父进程预设的 `tf` 模板。陷阱帧保存了CPU在发生中断或系统调用时的寄存器状态，当子进程第一次被调度，从内核态返回时，硬件会自动从这个陷阱帧恢复上下文，从而“跳转”到指定的代码位置开始执行。
-    *   **特殊处理**：对于通过 `fork` 产生的子进程，会**将返回值（通常保存在寄存器a0中）设置为0**。这是实现父子进程从 `fork` 返回不同值的关键。
-
-2.  **设置进程上下文（Context）**：
-    *   进程上下文（`struct context`）主要保存了**内核线程切换时需要保护的寄存器**（如ra, sp, callee-saved寄存器）。
-    *   `context.ra`（返回地址）被设置为 `forkret` 函数的地址。当调度器首次切换到子进程时，`switch_to` 函数会恢复这个 `ra`，执行流便会跳转到 `forkret`。`forkret` 函数最终会触发一个“从陷阱帧返回”的操作，使CPU开始执行子进程的代码。
-    *   `context.sp` 被设置为指向子进程自己的陷阱帧。这确保了在切换后，子进程的内核栈指针指向正确的初始位置。
-
-### **核心差异总结**
-
-为了更清晰地理解，下表对比了两个函数的核心职责：
-
-| 特性 | `copy_mm` | `copy_thread` |
-| :--- | :--- | :--- |
-| **核心职责** | 管理**内存空间**的继承方式 | 设置**执行现场**的初始状态 |
-| **处理对象** | 内存描述符（`mm_struct`）、页表、VMA | 陷阱帧（`trapframe`）、进程上下文（`context`） |
-| **关键决策** | 是否共享地址空间（`CLONE_VM`） | 根据 `esp` 判断是用户进程还是内核线程 |
-| **最终目的** | 让子进程拥有或共享一个可用的地址空间 | 让子进程在被调度时能从正确的起点开始执行 |
-
-简单来说，`copy_mm` 为子进程准备好了它将要操作的“舞台”（内存空间），而 `copy_thread` 则在这个舞台上为子进程设定了首次登场的“初始位置和姿势”（执行上下文）。两者共同协作，确保子进程被创建后能够正确地投入运行。
 
 ### 进程与线程
 #### 1. 程序
@@ -1246,65 +1271,6 @@ kernel_thread_entry:
 至此，initproc成功从“静态进程控制块”转变为“动态执行的内核线程”，开始运行预设的业务逻辑（如输出字符串）。
 
 
-### `proc.c`中各个函数的作用 
-
-#### `alloc_proc`
-- **作用**：分配并初始化一个新的`proc_struct`结构体，用于创建一个新的进程。
-- **逻辑**：调用`kmalloc`(类似于malloc，用于内核态)函数分配大小为`sizeof(proc_struct)`的内存空间，并初始化结构体的各个字段：
-  - 设置初始状态为`PROC_UNINIT`(未初始化)
-  - 设置pid为-1(表示未分配)
-  - 初始化context(上下文信息)和name(进程名称)字段
-  - 初始化链表连接`list_link`和`hash_link`
-  - 如果分配失败则函数返回NULL
-  
-#### `set_proc_name`&`get_proc_name`
-- **作用**：设置和获取进程名称。
-- **逻辑**：`set_proc_name`函数先使用`memset`清空`proc->name`，再用`memcpy`将字段设置为`name`参数，`get_proc_name`函数先使用`memset`设置缓冲区，在通过`memcpy`将字段写入缓冲区。
-
-#### `get_pid`
-- **作用**：分配一个新的唯一的进程ID。
-- **逻辑**：使用一对静态变量`last_pid`和`next_safe`管理PID的分配，遍历进程列表，确保如果找到可用的PID，则返回。
-  - 每次调用函数时，`last_pid`先递增，如果超过了`MAX_PID`则将其重置为1，并将next_safe设置`MAX_PID`。
-  - 如果last_pid大于等于next_safe，则说明当前的last_pid可能被使用，把next_safe重置为MAX_PID，然后遍历整个进程列表proc_list,检查每个进程的pid是否与last_pid相等，
-    - 如果找到相同的，则说明last_pid已被使用，递增last_pid重新查找
-    - 如果找到一个PID大于last_pid,但小于next_safe,则将next_safe设置为该PID。
-  - 最终返回找到的last_pid。
-
-#### `proc_run`
-- **作用**：将进程设置为当前运行的进程，并进行上下文切换。
-- **逻辑**：设置`current`指向当前进程，调用**`switch_to`**函数进行上下文切换。
-
-#### `forkret`
-- **作用**： 作为新进程的入口，调用`forkrets`函数，传入当前进程的陷阱帧。
-
-#### `hash_proc`&`find_proc`
-- **作用**：将进程插入基于PID的散列表中&基于PID查找进程。
-- **逻辑**：`hash_proc`函数先试用pid_hashfn计算散列值，之后将hash_link插入散列表对应位置中。`find_proc`函数通过pid_hashfn计算散列值，在散列表中查找pid对应的进程。
-
-#### `kernel_thread`
-- **作用**：创建内核线程，并返回线程的`proc_struct`指针
-- **逻辑**：调用do_fork创建线程
-
-#### setup_kstack 和 put_kstack
-- **作用**：分配和释放内核栈。
-
-#### copy_mm
-- **作用**：复制进程的内存管理结构。
-
-#### copy_thread
-- **作用**：设置子进程的陷阱帧和上下文信息
-
-#### do_fork
-
-- **作用**：创建一个新线程
-- **逻辑**：
-  - 调用 alloc_proc 分配新的 proc_struct。
-  - 调用 setup_kstack 为新进程分配内核栈。
-  - 调用 copy_mm 复制或共享内存空间。
-  - 调用 copy_thread 设置陷阱帧和上下文信息。
-  - 使用原子操作分配PID，并将新进程加入到进程列表和哈希表中。
-  - 将新进程设置为可运行状态。
-
 ### **setup_kstack：为进程分配内核栈**
 
 #### **功能作用**
@@ -1467,7 +1433,7 @@ idleproc->kstack = (uintptr_t)bootstack;
 
 
 
-### alloc_proc 和 do_fork 深度解析
+### alloc_proc 
 
 #### alloc_proc：进程控制块的初始化
 
@@ -1526,166 +1492,9 @@ static struct proc_struct *alloc_proc(void)
 
 4. **`mm = NULL`**：所有内核线程的 `mm` 都为 NULL，表示它们共享内核地址空间。
 
-#### do_fork：进程创建的核心流程
 
-##### **功能作用**
-`do_fork` 是创建新进程/线程的**核心函数**，它通过复制当前进程（父进程）来创建子进程，完成进程控制块分配、资源设置、上下文初始化等所有必要步骤。
 
-##### **具体实现分析**
 
-```c
-int do_fork(uint32_t clone_flags, uintptr_t stack, struct trapframe *tf)
-{
-    int ret = -E_NO_FREE_PROC;
-    struct proc_struct *proc;
-    
-    // 检查进程数量限制
-    if (nr_process >= MAX_PROCESS) {
-        goto fork_out;
-    }
-    ret = -E_NO_MEM;
-    
-    // 1. 分配进程控制块
-    if ((proc = alloc_proc()) == NULL) {
-        goto fork_out; 
-    }
-
-    // 2. 分配内核栈
-    if (setup_kstack(proc) != 0) {
-        goto bad_fork_cleanup_proc;
-    }
-
-    // 设置父进程指针
-    proc->parent = current;
-
-    // 3. 复制内存管理结构
-    if (copy_mm(clone_flags, proc) != 0) {
-        goto bad_fork_cleanup_kstack;
-    }
-
-    // 4. 设置执行上下文
-    copy_thread(proc, stack, tf);
-
-    // 5. 关键区操作（需要原子性）
-    bool intr_flag;
-    local_intr_save(intr_flag);  // 禁用中断
-    {
-        // 分配PID并加入各种列表
-        proc->pid = get_pid(); 
-        hash_proc(proc);
-        list_add(&proc_list, &proc->list_link);
-        nr_process++;
-
-        // 6. 设置进程为可运行状态
-        proc->state = PROC_RUNNABLE;
-    }
-    local_intr_restore(intr_flag);  // 恢复中断
-
-    // 7. 返回子进程PID
-    ret = proc->pid;
-
-fork_out:
-    return ret;
-
-// 错误处理路径
-bad_fork_cleanup_kstack:
-    put_kstack(proc);
-bad_fork_cleanup_proc:
-    kfree(proc);
-    goto fork_out;
-}
-```
-
-##### **引用的函数及其功能**
-
-| 被引用函数 | 功能说明 | 在 do_fork 中的作用 |
-|-----------|---------|-------------------|
-| **`alloc_proc`** | 分配进程控制块 | 创建并初始化基本的 proc_struct 结构 |
-| **`setup_kstack`** | 分配内核栈 | 为子进程分配独立的内核栈空间 |
-| **`copy_mm`** | 复制内存空间 | 根据 clone_flags 决定共享或复制内存管理结构 |
-| **`copy_thread`** | 设置执行上下文 | 初始化陷阱帧和进程上下文，设置执行起点 |
-| **`get_pid`** | 分配进程ID | 为子进程分配唯一的进程标识符 |
-| **`hash_proc`** | 加入哈希表 | 将进程加入PID哈希表，便于快速查找 |
-| **`list_add`** | 加入进程链表 | 将进程加入全局进程链表 |
-| **`put_kstack`** | 释放内核栈 | 错误处理时释放已分配的内核栈 |
-| **`kfree`** | 释放内存 | 错误处理时释放进程控制块 |
-
-##### **关键设计要点**
-
-###### **分层错误处理机制**
-```c
-// 资源申请顺序（必须逆序释放）
-alloc_proc() → setup_kstack() → copy_mm() → copy_thread()
-
-// 对应的错误处理标签
-bad_fork_cleanup_proc:    // 清理proc
-bad_fork_cleanup_kstack:  // 清理kstack，然后清理proc
-```
-这种设计确保了资源不会泄漏，符合"谁申请谁释放"的原则。
-
-###### **原子性保护的关键区**
-```c
-local_intr_save(intr_flag);  // 进入关键区
-{
-    proc->pid = get_pid();     // PID分配
-    hash_proc(proc);           // 加入哈希表  
-    list_add(...);             // 加入进程链表
-    nr_process++;              // 进程计数增加
-    proc->state = PROC_RUNNABLE; // 状态设置
-}
-local_intr_restore(intr_flag); // 离开关键区
-```
-**为什么需要原子性？**
-- 防止在PID分配过程中被中断，导致PID重复
-- 确保进程列表操作的一致性
-- 避免进程状态设置不完整时被调度
-
-###### **参数含义**
-- **`clone_flags`**：控制克隆行为的标志位
-  - `CLONE_VM`：共享地址空间（创建线程）
-  - 其他标志控制文件描述符、信号处理等的共享行为
-- **`stack`**：用户栈指针（对内核线程为0）
-- **`tf`**：陷阱帧模板，包含子进程的初始执行上下文
-
-##### **进程创建完整流程总结**
-
-```mermaid
-graph TD
-    A[do_fork开始] --> B[alloc_proc分配PCB]
-    B --> C[setup_kstack分配内核栈]
-    C --> D[copy_mm设置内存空间]
-    D --> E[copy_thread设置执行上下文]
-    E --> F[进入关键区禁用中断]
-    F --> G[get_pid分配PID]
-    G --> H[hash_proc加入哈希表]
-    H --> I[list_add加入进程链表]
-    I --> J[设置PROC_RUNNABLE状态]
-    J --> K[离开关键区启用中断]
-    K --> L[返回子进程PID]
-    
-    B -->|失败| M[直接返回错误]
-    C -->|失败| N[清理PCB后返回]
-    D -->|失败| O[清理内核栈和PCB后返回]
-```
-
-##### **与 kernel_thread 的关系**
-
-`do_fork` 是底层的进程创建原语，而 `kernel_thread` 是其上层封装：
-
-```c
-int kernel_thread(int (*fn)(void *), void *arg, uint32_t clone_flags) {
-    struct trapframe tf;
-    // 设置陷阱帧，指定线程入口函数和参数
-    tf.gpr.s0 = (uintptr_t)fn;      // 函数指针
-    tf.gpr.s1 = (uintptr_t)arg;     // 参数
-    tf.epc = (uintptr_t)kernel_thread_entry;  // 入口点
-    
-    // 调用do_fork实际创建线程
-    return do_fork(clone_flags | CLONE_VM, 0, &tf);
-}
-```
-
-**总结**：`alloc_proc` 负责"造壳"，创建基本的进程框架；`do_fork` 负责"填充内容"，完成资源分配和上下文设置，两者协同工作实现完整的进程创建功能。 
 
 
 ## 重要但在本实验中未涉及的知识点
