@@ -1165,6 +1165,82 @@ initproc用来创建特定的其他内核线程或用户进程的进程。（在
       将切换上下文的栈指针（sp）指向内核栈上的中断帧，保证进程切换时，CPU 能从该地址正确恢复中断帧中的执行状态。
 
 ### 第1个内核线程的调度和执行
+uCore中第1个内核线程initproc的调度与执行，是从idleproc主动让出CPU开始，经调度器选择、上下文切换、执行环境恢复，最终运行核心业务逻辑的完整过程。这一过程依赖于调度触发机制、进程选择算法、上下文切换逻辑及中断帧恢复机制的协同工作，具体流程如下：
+
+
+#### 一、调度触发：idleproc主动发起调度
+当uCore完成所有初始化工作后，当前执行的内核线程是idleproc（第0个内核线程）。此时idleproc会执行`cpu_idle`函数，进入无限循环并检测调度标志：
+```c
+void cpu_idle(void) {
+    while (1) {
+        if (current->need_resched) {  // current指向idleproc
+            schedule();  // 触发调度
+        }
+    }
+}
+```
+在idleproc的初始化过程中，`proc_init`已将其`need_resched`设为1，因此`cpu_idle`会立即调用`schedule()`函数，主动让出CPU资源，寻找其他就绪态进程执行——这是initproc被调度的起点。
+
+
+#### 二、进程选择：schedule函数选中initproc
+`schedule`函数是uCore的调度器核心，其核心逻辑是从进程链表`proc_list`中筛选出处于**PROC_RUNNABLE（就绪态）** 的进程。实验四中采用简单的FIFO调度策略，具体选择逻辑为：
+1. 重置当前进程（idleproc）的`need_resched`为0，避免重复调度；
+2. 遍历`proc_list`，从链表头开始查找就绪态进程（因当前进程是idleproc）；
+3. 此时`proc_list`中仅有两个进程：idleproc（状态为PROC_RUNNABLE）和initproc（状态为PROC_RUNNABLE）。由于idleproc主动让出CPU，调度器会优先选择initproc作为下一个执行的进程。
+
+
+#### 三、上下文切换：从idleproc切换到initproc
+找到initproc后，`schedule`调用`proc_run(next)`（`next`即initproc）完成进程切换，核心操作由`proc_run`和`switch_to`共同实现：
+
+1. **proc_run的准备工作**  
+   `proc_run`主要完成切换前的辅助配置：
+   - 更新`current`指针，将当前运行进程标记为initproc；
+   - 切换页表（内核线程共享`boot_pgdir`，此步骤无实际地址空间变化，为后续用户进程预留逻辑）；
+   - 调用`switch_to(from, to)`，其中`from`为idleproc，`to`为initproc，触发实际的上下文切换。
+
+2. **switch_to的切换**  
+   `switch_to`是位于`switch.S`的汇编函数，负责保存旧进程上下文、恢复新进程上下文，是CPU执行权真正转移的关键：
+   ```asm
+   .globl switch_to
+   switch_to:
+       # 保存idleproc的寄存器上下文到其context结构
+       STORE ra, 0*REGBYTES(a0)   # 保存返回地址
+       STORE sp, 1*REGBYTES(a0)   # 保存栈指针
+       STORE s0-s11, ...          # 保存被调用者保存寄存器
+       
+       # 从initproc的context结构恢复寄存器上下文
+       LOAD ra, 0*REGBYTES(a1)    # 恢复返回地址（指向forkrets）
+       LOAD sp, 1*REGBYTES(a1)    # 恢复栈指针
+       LOAD s0-s11, ...           # 恢复被调用者保存寄存器
+       
+       ret  # 跳转到恢复后的ra（即forkrets）
+   ```
+   关键细节：initproc的`context.ra`在`copy_thread`中被预设为`forkrets`函数地址，因此`switch_to`执行后，CPU会跳转到`forkrets`。
+
+
+#### 四、从forkrets到中断帧恢复
+`forkrets`是过渡函数，负责将栈指针指向initproc的中断帧，为完整恢复执行环境做准备：
+```asm
+.globl forkrets
+forkrets:
+    move sp, a0  # a0指向initproc的中断帧（proc->tf），将栈指针指向中断帧
+    j __trapret  # 跳转到中断返回处理函数
+```
+`__trapret`是通用中断返回函数，会从`sp`指向的中断帧中恢复所有寄存器状态：
+- 恢复`status`寄存器：确保initproc运行在内核态（Supervisor模式），并按预设规则启用/禁用中断；
+- 恢复`epc`寄存器：`epc`在`kernel_thread`中被设为`kernel_thread_entry`的地址，因此`__trapret`执行后，CPU会跳转到`kernel_thread_entry`。
+
+
+#### 五、initproc
+`kernel_thread_entry`是initproc真正执行业务逻辑的起点，其汇编实现完成参数传递与核心函数调用：
+```asm
+.globl kernel_thread_entry
+kernel_thread_entry:
+    move a0, s1  # 将s1中保存的函数参数（如"Hello world!!"）传递给a0
+    jalr s0      # 跳转到s0指向的函数（如init_main）执行
+    jal do_exit  # 函数执行完毕后，调用do_exit释放资源
+```
+至此，initproc成功从“静态进程控制块”转变为“动态执行的内核线程”，开始运行预设的业务逻辑（如输出字符串）。
 
 
 ### `proc.c`中各个函数的作用 
