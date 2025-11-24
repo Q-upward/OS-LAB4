@@ -228,11 +228,11 @@ get_pid(void)
 
 
 
-# 练习3:编写proc_run 函数
+## 练习3:编写proc_run 函数
 
-## 一、设计实现过程说明
+### 一、设计实现过程说明
 
-### 问题：
+#### 问题：
 proc_run用于将指定的进程切换到CPU上运行。它的大致执行步骤包括：
 - 检查要切换的进程是否与当前正在运行的进程相同，如果相同则不需要切换。
 - 禁用中断。你可以使用/kern/sync/sync.h中定义好的宏local_intr_save(x)和local_intr_restore(x)来实现关、开中断。
@@ -242,12 +242,12 @@ proc_run用于将指定的进程切换到CPU上运行。它的大致执行步骤
 - 允许中断。
 
 
-### 请回答如下问题：
+#### 请回答如下问题：
 1. 在本实验的执行过程中，创建且运行了几个内核线程？
 2. 完成代码编写后，编译并运行代码：make qemu
 
 
-### 实现的代码：
+#### 实现的代码：
 ```c
 void
 proc_run(struct proc_struct *proc) {
@@ -275,7 +275,7 @@ proc_run(struct proc_struct *proc) {
 ```
 
 
-### 说明：
+#### 说明：
 `if (proc != current) { ... }`  
 首先检查是否需要切换，如果目标进程（proc）就是当前正在运行的进程（current），则无需任何操作，直接返回，从而避免无意义的切换开销。
 
@@ -320,6 +320,9 @@ proc_run(struct proc_struct *proc) {
   - 通过 `set_proc_name(initproc, "init")` 将进程名设为 `"init"`；
   - 绑定执行函数 `init_main`，运行时会打印 `this initproc, pid = 1, name = "init"` 等信息。
 - **核心作用**：系统首个有功能的内核线程，负责完成内核子系统的后续初始化工作，是用户进程的“父进程”样例。
+
+### 三、实验结果
+<img width="528" height="141" alt="9865d8f0028fb702398ec22e6c3479d3" src="https://github.com/user-attachments/assets/74c1b14a-2a78-484d-af5d-2539cd1eb18a" />
 
 ## 扩展练习 Challenge
 
